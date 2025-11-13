@@ -25,7 +25,7 @@ gauss_std: 7.
 return_radio_features: True
 
 # Whether to compile the model.
-compile: ${compile}
+compile: False
 
 # Whether to use automatic mixed percision when inferring.
 amp: ${amp}

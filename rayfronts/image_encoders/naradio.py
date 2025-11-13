@@ -181,7 +181,7 @@ class NARadioEncoder(LangSpatialGlobalImageEncoder):
                input_resolution: Tuple[int,int] = [512,512],
                gauss_std: float = 7.0,
                return_radio_features: bool = True,
-               compile: bool = True,
+               compile: bool = False,
                amp: bool = True):
     """
 

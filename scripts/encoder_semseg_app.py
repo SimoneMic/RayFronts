@@ -22,6 +22,8 @@ from PIL import Image
 import numpy as np
 import torch
 from matplotlib import cm
+from matplotlib.colors import Normalize
+import matplotlib.pyplot as plt
 import hydra
 from hydra.core.config_store import ConfigStore
 
@@ -46,7 +48,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 prompt_list = []
 color_list = []
 
-def apply_colormap(image: np.ndarray, cmap_name='viridis') -> np.ndarray:
+def apply_colormap(image: np.ndarray, cmap_name='turbo') -> np.ndarray:
   """Apply a colormap to a grayscale image and return an RGB uint8 image."""
   # Ensure image is normalized to [0, 1]
   if image.dtype != np.float16 and image.dtype != np.float32 and image.dtype != np.float64:
@@ -65,7 +67,7 @@ def numpy_to_base64(img_array):
   pil_img.save(buffered, format="PNG")
   return base64.b64encode(buffered.getvalue()).decode()
 
-def make_grid_output(images, labels):
+def make_grid_output(images, labels, show_colorbar=True):
   html = """
   <div style='display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px;'>
   """
@@ -78,7 +80,41 @@ def make_grid_output(images, labels):
     </div>
     """
   html += "</div>"
+
+  # Append colorbar legend if requested
+  if show_colorbar:
+      colorbar_str = make_colorbar_image('turbo', vmin=-1, vmax=1, orientation='horizontal')
+      html += f"""
+      <div style='margin-top: 20px; text-align: center;'>
+        <img src='data:image/png;base64,{colorbar_str}' style='width: 60%; height: auto;' />
+      </div>
+      """
   return html
+
+def make_colorbar_image(cmap_name='turbo', vmin=-1, vmax=1, orientation='horizontal'):
+    """Return a base64-encoded colorbar image."""
+    cmap = cm.get_cmap(cmap_name)
+    norm = Normalize(vmin=vmin, vmax=vmax)
+    
+    fig, ax = plt.subplots(figsize=(5, 0.5) if orientation == 'horizontal' else (0.5, 5))
+    fig.subplots_adjust(bottom=0.5 if orientation == 'horizontal' else 0.1)
+    
+    cb = plt.colorbar(
+        cm.ScalarMappable(norm=norm, cmap=cmap),
+        cax=ax,
+        orientation=orientation
+    )
+    cb.set_label('Cosine similarity', fontsize=10)
+    cb.ax.tick_params(labelsize=8)
+    
+    buf = BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight', dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    
+    # Convert buffer to base64 string
+    img_str = base64.b64encode(buf.read()).decode('utf-8')
+    return img_str
 
 def generate_distinct_color(index):
   """Generate visually distinct colors using HSV color space."""
