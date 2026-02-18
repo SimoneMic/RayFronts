@@ -153,8 +153,8 @@ def on_page_load():
   return gr.update(value="")
 
 @torch.inference_mode()
-def process_all(input_image, use_templates, softmax, resolution,
-                model, chunk_size):
+def process_all(input_image, image_processor, use_templates, softmax, resolution,
+                cradio_model, chunk_size):
   N = len(prompt_list)
   resolution = (resolution, resolution)
   if N == 0:
@@ -162,21 +162,11 @@ def process_all(input_image, use_templates, softmax, resolution,
   elif softmax and N == 1:
     raise gr.Error("With softmax enabled, you need at least two prompts", duration=5)
 
-  if hasattr(model, "input_resolution"):
-    model.input_resolution = resolution
-
   logger.info("Prompts submitted: %s", str(prompt_list))
   m = "Computing feature map.."
   logger.info(m)
   yield m
-  #
-  hf_repo = "nvidia/C-RADIOv4-H"
-
-  image_processor = CLIPImageProcessor.from_pretrained(hf_repo)
-  #cradio_model = AutoModel.from_pretrained(hf_repo, trust_remote_code=True)
-  cradio_model = torch.hub.load('NVlabs/RADIO', 'radio_model', version="c-radio_v4-h", progress=True, skip_validation=True, adaptor_names=['siglip2-g'])
-  cradio_model.eval().cuda()
-
+  # Image processing
   image = Image.fromarray(input_image)
   pixel_values = image_processor(images=image, return_tensors='pt', do_resize=True).pixel_values
   pixel_values = pixel_values.cuda()
@@ -189,31 +179,18 @@ def process_all(input_image, use_templates, softmax, resolution,
                           )
   #backbone_summary, backbone_features = cradio_model(resized_pixel_values)
   out_dict = cradio_model(resized_pixel_values)
-  backbone_summary, backbone_features = out_dict['backbone']
+  #backbone_summary, backbone_features = out_dict['backbone']
   sig2_vis_summary, sig2_vis_features = out_dict['siglip2-g']
   
-  spatial_features = rearrange(backbone_features, 'b (h w) d -> b d h w', 
+  sig2_spatial_features = rearrange(sig2_vis_features, 'b (h w) d -> b d h w', 
                                h=resized_pixel_values.shape[-2] // cradio_model.patch_size, 
                                w=resized_pixel_values.shape[-1] // cradio_model.patch_size)
-  upsampled_feat  = F.interpolate(
-                        spatial_features,
+  sig2_upsampled_feat  = F.interpolate(
+                        sig2_spatial_features,
                         size=resolution,
                         mode='bilinear',
                         align_corners=False,
-                    )
-  
-  
-  
-
-  #tensor_image = torch.from_numpy(input_image).permute(2, 0, 1)
-  #tensor_image = tensor_image.to(device).float() / 255.0
-  #tensor_image = torch.nn.functional.interpolate(
-  #  tensor_image.unsqueeze(0), resolution, mode="bilinear", antialias=True)
-  #feat_map = model.encode_image_to_feat_map(tensor_image)
-  #feat_map = model.align_spatial_features_with_language(feat_map)
-  #feat_map = torch.nn.functional.interpolate(
-  #  feat_map, resolution, mode="bilinear", antialias=True)
-  #feat_map = feat_map.squeeze(0).permute(1, 2, 0)
+                    ).squeeze(0)
 
   m = "Computing prompt embeddings.."
   logger.info(m)
@@ -221,30 +198,27 @@ def process_all(input_image, use_templates, softmax, resolution,
   # Text encoding
   sig2_adaptor = cradio_model.adaptors['siglip2-g']
   with torch.autocast("cuda", dtype=torch.float16, enabled=True):
-    text_input = sig2_adaptor.tokenizer(prompt_list).to(cradio_model.device)
-    text_tokens = sig2_adaptor.encode_labels(text_input, normalize=True)
-  #if use_templates:
-  #  prompt_embeddings = model.encode_labels(prompt_list)
-  #else:
-  #  prompt_embeddings = model.encode_prompts(prompt_list)
-    # This should do what the OG code was doing here:
-      #text = cradio_model.lang_adaptor.tokenizer(prompt_list).to(cradio_model.device)
-      #text_features = cradio_model.lang_adaptor.encode_text(text)
-      #text_features /= text_features.norm(dim=-1, keepdim=True)
+    text_input = sig2_adaptor.tokenizer(prompt_list).to("cuda")
+    # Normalized text/prompts features
+    text_tokens = sig2_adaptor.encode_text(text_input, normalize=True)
 
   m = "Computing cosine similarity.."
   logger.info(m)
   yield m
-  H,W,C = feat_map.shape
-  feat_map = feat_map.reshape(-1, C)
-  num_chunks = int(np.ceil(feat_map.shape[0] / chunk_size))
-  cos_sim = list()
-  for c in range(num_chunks):
-    cos_sim.append(utils.compute_cos_sim(
-      text_tokens, feat_map[c*chunk_size: (c+1)*chunk_size],
-      softmax=softmax))
-  cos_sim = torch.cat(cos_sim, dim=0)
-  cos_sim = cos_sim.reshape(H,W,N)
+  #sim = F.cosine_similarity(sig2_upsampled_feat, text_tokens)
+  C, H, W = sig2_upsampled_feat.shape
+  # Move features last so spatial layout is preserved
+  sig2_upsampled_feat = sig2_upsampled_feat.permute(1, 2, 0)  # (H, W, C)
+  # Flatten
+  sig2_upsampled_feat = sig2_upsampled_feat.reshape(-1, C)    # (HW, C)
+  # Normalize for computing cossim
+  sig2_upsampled_feat = F.normalize(sig2_upsampled_feat, dim=-1)    # (HW, C)
+  logits = sig2_upsampled_feat @ text_tokens.T      # (HW, N)
+  # Softmax across prompts
+  logits = torch.softmax(150 * logits, dim=-1)
+  # Reshape back to original image shape
+  cos_sim = logits.reshape(H, W, N)
+
   m = "Visualizing.."
   logger.info(m)
   yield m
@@ -262,12 +236,12 @@ def process_all(input_image, use_templates, softmax, resolution,
             config_name="default")
 @torch.inference_mode()
 def main(cfg=None):
-  encoder_kwargs = dict()
-  if "NARadioEncoder" in cfg.encoder._target_:
-    encoder_kwargs["input_resolution"] = [224, 224]
-    encoder_kwargs["compile"] = False # Compiling will make resolution changes slow
-
-  encoder = hydra.utils.instantiate(cfg.encoder, **encoder_kwargs)
+  #encoder_kwargs = dict()
+  #if "NARadioEncoder" in cfg.encoder._target_:
+  #  encoder_kwargs["input_resolution"] = [224, 224]
+  #  encoder_kwargs["compile"] = False # Compiling will make resolution changes slow
+#
+  #encoder = hydra.utils.instantiate(cfg.encoder, **encoder_kwargs)
   step = 16
 
   with gr.Blocks() as demo:
@@ -301,12 +275,23 @@ def main(cfg=None):
         # output_image = gr.Image(label="Output Image", type="numpy")
         output_image = gr.HTML()
 
+      hf_repo = "nvidia/C-RADIOv4-H"
+      image_processor = CLIPImageProcessor.from_pretrained(hf_repo)
+      #cradio_model = AutoModel.from_pretrained(hf_repo, trust_remote_code=True)
+      cradio_model = torch.hub.load('NVlabs/RADIO', 
+                                    'radio_model', 
+                                    version="c-radio_v4-h", 
+                                    progress=True, 
+                                    skip_validation=True, 
+                                    adaptor_names=['siglip2-g'])
+      cradio_model.eval().cuda()
+
       add_button.click(
         fn=add_prompt,
         inputs=prompt,
         outputs=[prompt, prompt_display])
       process_button.click(
-        fn=partial(process_all, model=encoder, chunk_size=cfg.chunk_size),
+        fn=partial(process_all, cradio_model=cradio_model, image_processor=image_processor, chunk_size=cfg.chunk_size),
         inputs=[input_image, use_templates, softmax, res_slider],
         outputs=output_image)
       clear_button.click(
