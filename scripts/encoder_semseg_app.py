@@ -153,8 +153,8 @@ def on_page_load():
   return gr.update(value="")
 
 @torch.inference_mode()
-def process_all(input_image, image_processor, use_templates, softmax, resolution,
-                cradio_model, chunk_size):
+def process_all(input_image, use_templates, softmax, resolution,
+                cradio_model, image_processor, lang_adaptor, chunk_size):
   N = len(prompt_list)
   resolution = (resolution, resolution)
   if N == 0:
@@ -179,14 +179,16 @@ def process_all(input_image, image_processor, use_templates, softmax, resolution
                           )
   #backbone_summary, backbone_features = cradio_model(resized_pixel_values)
   out_dict = cradio_model(resized_pixel_values)
-  #backbone_summary, backbone_features = out_dict['backbone']
-  sig2_vis_summary, sig2_vis_features = out_dict['siglip2-g']
+  backbone_summary, backbone_features = out_dict['backbone']
+  #sig2_vis_summary, sig2_vis_features = out_dict['siglip2-g']
+  # aligment:
+  lang_feat = lang_adaptor.head_mlp(backbone_features)
   
-  sig2_spatial_features = rearrange(sig2_vis_features, 'b (h w) d -> b d h w', 
+  lang_feat = rearrange(lang_feat, 'b (h w) d -> b d h w', 
                                h=resized_pixel_values.shape[-2] // cradio_model.patch_size, 
                                w=resized_pixel_values.shape[-1] // cradio_model.patch_size)
-  sig2_upsampled_feat  = F.interpolate(
-                        sig2_spatial_features,
+  lang_feat  = F.interpolate(
+                        lang_feat,
                         size=resolution,
                         mode='bilinear',
                         align_corners=False,
@@ -206,16 +208,17 @@ def process_all(input_image, image_processor, use_templates, softmax, resolution
   logger.info(m)
   yield m
   #sim = F.cosine_similarity(sig2_upsampled_feat, text_tokens)
-  C, H, W = sig2_upsampled_feat.shape
+  C, H, W = lang_feat.shape
   # Move features last so spatial layout is preserved
-  sig2_upsampled_feat = sig2_upsampled_feat.permute(1, 2, 0)  # (H, W, C)
+  lang_feat = lang_feat.permute(1, 2, 0)  # (H, W, C)
   # Flatten
-  sig2_upsampled_feat = sig2_upsampled_feat.reshape(-1, C)    # (HW, C)
+  lang_feat = lang_feat.reshape(-1, C)    # (HW, C)
   # Normalize for computing cossim
-  sig2_upsampled_feat = F.normalize(sig2_upsampled_feat, dim=-1)    # (HW, C)
-  logits = sig2_upsampled_feat @ text_tokens.T      # (HW, N)
+  lang_feat = F.normalize(lang_feat, dim=-1)    # (HW, C)
+  logits = lang_feat @ text_tokens.T      # (HW, N)
   # Softmax across prompts
-  logits = torch.softmax(150 * logits, dim=-1)
+  if softmax:
+    logits = torch.softmax(100 * logits, dim=-1)
   # Reshape back to original image shape
   cos_sim = logits.reshape(H, W, N)
 
@@ -278,20 +281,22 @@ def main(cfg=None):
       hf_repo = "nvidia/C-RADIOv4-H"
       image_processor = CLIPImageProcessor.from_pretrained(hf_repo)
       #cradio_model = AutoModel.from_pretrained(hf_repo, trust_remote_code=True)
+      lang_adaptor_name = 'siglip2-g'
       cradio_model = torch.hub.load('NVlabs/RADIO', 
                                     'radio_model', 
                                     version="c-radio_v4-h", 
                                     progress=True, 
                                     skip_validation=True, 
-                                    adaptor_names=['siglip2-g'])
+                                    adaptor_names=[lang_adaptor_name])
       cradio_model.eval().cuda()
+      lang_adaptor = cradio_model.adaptors[lang_adaptor_name]
 
       add_button.click(
         fn=add_prompt,
         inputs=prompt,
         outputs=[prompt, prompt_display])
       process_button.click(
-        fn=partial(process_all, cradio_model=cradio_model, image_processor=image_processor, chunk_size=cfg.chunk_size),
+        fn=partial(process_all, cradio_model=cradio_model, image_processor=image_processor, lang_adaptor=lang_adaptor, chunk_size=cfg.chunk_size),
         inputs=[input_image, use_templates, softmax, res_slider],
         outputs=output_image)
       clear_button.click(
